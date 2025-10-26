@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+env/
+.venv/
+venv/
+*.env
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# DB and backups
+cryptobase.db
+backups/
+app_backups/
+*.bak
+
+# Logs
+*.log
+
+# Build
+dist/
+build/
+
+# Secrets
+*.pem
+*.key

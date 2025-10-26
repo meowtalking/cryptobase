@@ -1,0 +1,27 @@
+# GUI
+PyQt5>=5.15
+
+# Базы данных
+SQLAlchemy>=2.0
+pysqlcipher3>=1.0        # Для шифрованной SQLite
+pymongo>=4.5             # Для серверного хранения
+dnspython>=2.3           # Для MongoDB SRV подключений
+
+# Хэширование и шифрование
+cryptography>=41.0
+bcrypt>=4.0
+xxhash>=3.3
+
+# FastAPI сервер
+fastapi>=0.111
+uvicorn>=0.26
+
+# Работа с HTTP
+aiohttp>=3.9
+
+# Отчёты и экспорт
+reportlab>=4.0
+pandas>=2.1
+
+# Утилиты
+python-dotenv>=1.0   # Для хранения секретов/ключей
