@@ -1,13 +1,12 @@
-from app.services.file_manager import add_file
-from app.services.integrity_manager import check_file, check_all_files
+import sys
+from PyQt5.QtWidgets import QApplication
+from app.ui.main_window import MainWindow
 
-# Добавляем новый файл
-file_info = add_file("/Users/macbook/Documents/код_бд.docx", "sha256")
+def main():
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
 
-# Проверяем этот файл
-result = check_file(file_info["id"])
-print(result)
-
-# Проверяем все файлы
-all_results = check_all_files()
-print(all_results)
+if __name__ == "__main__":
+    main()

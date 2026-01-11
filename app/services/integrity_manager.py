@@ -2,18 +2,20 @@ import os
 from datetime import datetime
 from sqlalchemy.orm import Session
 from app.models import FileRecord, FileVersion, LogEntry
-from app.services.security import compute_hash
+from app.services.file_manager import compute_hash
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-# ===================================
-# 🧩 Проверка целостности файла
-# ===================================
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+
+def now_msk():
+    return datetime.now(MOSCOW_TZ)
 
 import os
 from datetime import datetime
 from sqlalchemy.orm import Session
 from app.models import FileRecord, FileVersion, LogEntry
-from app.services.security import compute_hash
 
 
 def check_file_integrity(db: Session, file_id: int):
@@ -35,7 +37,7 @@ def check_file_integrity(db: Session, file_id: int):
         return "Missing"
 
     # Вычисляем текущий хэш
-    current_hash = compute_hash(file_record.path, file_record.algorithm)
+    current_hash = compute_hash(file_record.path)
 
     # Берём последнюю зафиксированную версию
     last_version = (
@@ -70,7 +72,7 @@ def check_file_integrity(db: Session, file_id: int):
         version = FileVersion(
             file_id=file_record.id,
             version_hash=current_hash,
-            created_at=datetime.utcnow(),
+            created_at=now_msk(),
             comment="Изменение обнаружено системой"
         )
         db.add(version)
@@ -116,7 +118,7 @@ def update_file_hash(db: Session, file_id: int, algorithm: str = None):
     if algorithm:
         file_record.algorithm = algorithm
 
-    new_hash = compute_hash(file_record.path, file_record.algorithm)
+    new_hash = compute_hash(file_record.path)
     file_record.current_hash = new_hash
     file_record.updated_at = datetime.utcnow()
 
@@ -124,7 +126,7 @@ def update_file_hash(db: Session, file_id: int, algorithm: str = None):
     version = FileVersion(
         file_id=file_record.id,
         version_hash=new_hash,
-        created_at=datetime.utcnow(),
+        created_at=now_msk(),
         comment="Хэш обновлён пользователем"
     )
     db.add(version)
@@ -134,11 +136,7 @@ def update_file_hash(db: Session, file_id: int, algorithm: str = None):
 
     return new_hash
 
-
-# ===================================
-# 🧾 Логирование действий системы
-# ===================================
-
+# Логирование действий системы
 # def _log_action(db: Session, action: str, file_name: str, result: str, user_name: str = None):
 #     log = LogEntry(
 #         action=action,

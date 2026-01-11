@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from sqlalchemy import create_engine
 import os
@@ -42,6 +42,7 @@ class FileVersion(Base):
     version_hash = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     comment = Column(String, default="")         # комментарий к версии
+    user_name = Column(String)
     location = Column(String, default="local")  # local / server
 
     file = relationship("FileRecord", back_populates="versions")
@@ -83,6 +84,7 @@ def init_db():
     print("🔧 Initializing database...")
     Base.metadata.create_all(engine)
     print("✅ Database initialized!")
+Base.metadata.create_all(bind=engine)
 
 if __name__ == "__main__":
     init_db()

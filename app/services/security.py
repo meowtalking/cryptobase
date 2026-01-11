@@ -1,68 +1,55 @@
-import hashlib
-import bcrypt
-import xxhash
 import os
+import bcrypt
+import base64
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-
-# ==============================
-# 🔐 Алгоритмы хэширования файлов
-# ==============================
-
-def compute_hash(file_path: str, algorithm: str = "sha256") -> str:
-    """
-    Вычисляет хэш для указанного файла выбранным алгоритмом.
-    Поддерживает: sha256, sha512, blake2b, md5, xxhash.
-    """
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Файл не найден: {file_path}")
-
-    # Определяем размер блока для чтения (чтобы не грузить память)
-    block_size = 65536
-
-    # Выбор алгоритма
-    if algorithm.lower() == "sha256":
-        hasher = hashlib.sha256()
-    elif algorithm.lower() == "sha512":
-        hasher = hashlib.sha512()
-    elif algorithm.lower() == "blake2b":
-        hasher = hashlib.blake2b()
-    elif algorithm.lower() == "md5":
-        hasher = hashlib.md5()
-    elif algorithm.lower() == "xxhash":
-        hasher = xxhash.xxh64()
-    else:
-        raise ValueError(f"Неподдерживаемый алгоритм: {algorithm}")
-
-    # Читаем файл по блокам
-    with open(file_path, "rb") as f:
-        while chunk := f.read(block_size):
-            hasher.update(chunk)
-
-    # Возвращаем итоговый хэш в hex
-    return hasher.hexdigest()
-
-
-# ==================================
-# 🔒 Хэширование и проверка паролей
-# ==================================
-
-def hash_password(password: str) -> str:
-    """
-    Хэширует пароль с использованием bcrypt + соль.
-    Возвращает строку, которую можно хранить в БД.
-    """
-    if not password:
-        raise ValueError("Пароль не может быть пустым.")
+def hash_password_for_db(password: str) -> str:
+    """Создаёт bcrypt-хэш для хранения в базе."""
     salt = bcrypt.gensalt()
     hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
     return hashed.decode('utf-8')
 
-
-def verify_password(password: str, hashed: str) -> bool:
-    """
-    Проверяет, совпадает ли введённый пароль с сохранённым хэшем.
-    """
+def verify_password_for_db(password: str, stored_hash: str) -> bool:
+    """Проверяет введённый пароль с хэшем из базы."""
     try:
-        return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+        return bcrypt.checkpw(password.encode('utf-8'), stored_hash.encode('utf-8'))
     except Exception:
         return False
+
+def derive_key(password: str, salt: bytes) -> bytes:
+    """Генерирует ключ для Fernet по паролю и соли"""
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=100_000,
+    )
+    return base64.urlsafe_b64encode(kdf.derive(password.encode()))
+
+def encrypt_file(file_path: str, password: str):
+    """Шифрует файл, сохраняет соль + зашифрованные данные"""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Файл не найден: {file_path}")
+
+    salt = os.urandom(16)
+    key = derive_key(password, salt)
+    fernet = Fernet(key)
+
+    with open(file_path, "rb") as f:
+        data = f.read()
+
+    encrypted = fernet.encrypt(data)
+    with open(file_path, "wb") as f:
+        f.write(salt + encrypted)
+
+def decrypt_file(file_path: str, password: str) -> bytes:
+    """Дешифрует файл, используя соль из файла"""
+    with open(file_path, 'rb') as f:
+        data = f.read()
+    salt = data[:16]
+    encrypted = data[16:]
+    key = derive_key(password, salt)
+    fernet = Fernet(key)
+    return fernet.decrypt(encrypted)

@@ -31,3 +31,5 @@ build/
 # Secrets
 *.pem
 *.key
+cryptobase-cloud-firebase-adminsdk-fbsvc-0240f3e337.json
+/Users/macbook/PycharmProjects/cryptobase/app/services/firebase_config.py
