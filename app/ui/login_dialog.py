@@ -1,52 +1,130 @@
 # app/ui/login_dialog.py
-from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLineEdit, QPushButton, QLabel, QMessageBox
-# from app.services.firebase_auth import login, register
-from requests.exceptions import HTTPError
+
+import os
+import re
+from pathlib import Path
+from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QLineEdit, QPushButton, QMessageBox
+from argon2 import PasswordHasher, low_level
+from argon2.exceptions import VerifyMismatchError
+import secrets
+
+# Константы
+CONFIG_DIR = Path.home() / ".cryptobase"
+SALT_FILE = CONFIG_DIR / "master_salt.bin"
+HASH_FILE = CONFIG_DIR / "master_hash.bin"
+
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
 
 class LoginDialog(QDialog):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Вход в CryptoBase")
-        self.setGeometry(400, 400, 300, 150)
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("CryptoBase — Вход")
+        self.setFixedSize(420, 220)
+        self.is_first_time = not HASH_FILE.exists()
 
-        layout = QVBoxLayout()
-        self.email_input = QLineEdit()
-        self.email_input.setPlaceholderText("Email")
-        layout.addWidget(self.email_input)
+        self.layout = QVBoxLayout()
+        self.init_ui()
+        self.setLayout(self.layout)
 
-        self.password_input = QLineEdit()
-        self.password_input.setEchoMode(QLineEdit.Password)
-        self.password_input.setPlaceholderText("Пароль")
-        layout.addWidget(self.password_input)
+    def init_ui(self):
+        if self.is_first_time:
+            self.setWindowTitle("CryptoBase — Установка мастер-пароля")
+            title_text = "Установите мастер-пароль для защиты данных"
+        else:
+            title_text = "Введите мастер-пароль"
 
-        self.login_btn = QPushButton("Войти")
-        self.login_btn.clicked.connect(self.handle_login)
-        layout.addWidget(self.login_btn)
+        self.label = QLabel(title_text)
+        self.label.setWordWrap(True)
+        self.layout.addWidget(self.label)
 
-        self.register_btn = QPushButton("Регистрация")
-        self.register_btn.clicked.connect(self.handle_register)
-        layout.addWidget(self.register_btn)
+        self.password_edit = QLineEdit()
+        self.password_edit.setEchoMode(QLineEdit.Password)
+        self.layout.addWidget(QLabel("Пароль:"))
+        self.layout.addWidget(self.password_edit)
 
-        self.setLayout(layout)
+        if self.is_first_time:
+            self.confirm_edit = QLineEdit()
+            self.confirm_edit.setEchoMode(QLineEdit.Password)
+            self.layout.addWidget(QLabel("Подтвердите пароль:"))
+            self.layout.addWidget(self.confirm_edit)
 
+        btn = QPushButton("Подтвердить")
+        btn.clicked.connect(self.try_accept)
+        self.layout.addWidget(btn)
 
-    #
-    # def handle_login(self):
-    #     email = self.email_input.text()
-    #     password = self.password_input.text()
-    #     try:
-    #         login(email, password)
-    #         QMessageBox.information(self, "Успех", f"Вы вошли как {email}")
-    #         self.accept()
-    #     except HTTPError as e:
-    #         QMessageBox.critical(self, "Ошибка", str(e))
-    #
-    # def handle_register(self):
-    #     email = self.email_input.text()
-    #     password = self.password_input.text()
-    #     try:
-    #         register(email, password)
-    #         QMessageBox.information(self, "Успех", f"Пользователь {email} зарегистрирован")
-    #         self.accept()
-    #     except HTTPError as e:
-    #         QMessageBox.critical(self, "Ошибка", str(e))
+    def try_accept(self):
+        password = self.password_edit.text().strip()
+
+        if not password:
+            QMessageBox.warning(self, "Ошибка", "Пароль не может быть пустым")
+            return
+
+        if self.is_first_time:
+            confirm = self.confirm_edit.text().strip()
+            if password != confirm:
+                QMessageBox.warning(self, "Ошибка", "Пароли не совпадают")
+                return
+
+            if not self.is_password_strong(password):
+                self.show_password_requirements()
+                return
+
+            # Генерируем и сохраняем соль (16 байт)
+            salt = secrets.token_bytes(16)
+            with open(SALT_FILE, "wb") as f:
+                f.write(salt)
+
+            # Хэш пароля для проверки (хранится отдельно)
+            ph = PasswordHasher(time_cost=4, memory_cost=65536, parallelism=4)
+            hash_value = ph.hash(password)
+
+            with open(HASH_FILE, "wb") as f:
+                f.write(hash_value.encode('utf-8'))
+
+            # Передаём пароль родительскому окну для генерации master_key
+            self.parent().set_password_for_key(password)
+
+            QMessageBox.information(self, "Успех", "Мастер-пароль установлен!")
+            self.accept()
+
+        else:
+            if not HASH_FILE.exists():
+                QMessageBox.critical(self, "Ошибка", "Файл хэша не найден")
+                self.reject()
+                return
+
+            with open(HASH_FILE, "rb") as f:
+                stored_hash = f.read().decode('utf-8').strip()
+
+            ph = PasswordHasher()
+            try:
+                ph.verify(stored_hash, password)
+                # Передаём пароль родителю для генерации ключа
+                self.parent().set_password_for_key(password)
+                self.accept()
+            except VerifyMismatchError:
+                QMessageBox.critical(self, "Ошибка", "Неверный мастер-пароль")
+
+    @staticmethod
+    def is_password_strong(pw: str) -> bool:
+        if len(pw) < 8: return False
+        if not re.search(r'[a-z]', pw): return False
+        if not re.search(r'[A-Z]', pw): return False
+        if not re.search(r'[!@#$%^&*()_+\-=\[\]{};\'\\:"|<,./<>?`~]', pw): return False
+        return True
+
+    def show_password_requirements(self):
+        msg = (
+            "Требования к паролю:\n\n"
+            "• Минимум 8 символов\n"
+            "• Хотя бы одна строчная буква (a–z)\n"
+            "• Хотя бы одна заглавная буква (A–Z)\n"
+            "• Хотя бы один специальный символ (!@#$%^&*()_+-= и т.п.)"
+        )
+        QMessageBox.warning(self, "Слабый пароль", msg)
+
+    def reject(self):
+        # При любом закрытии диалога (крестик, Esc) — просто возвращаем Rejected
+        # Выход обрабатывается в MainWindow
+        super().reject()

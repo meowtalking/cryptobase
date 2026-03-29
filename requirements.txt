@@ -25,3 +25,8 @@ pandas>=2.1
 
 # Утилиты
 python-dotenv>=1.0   # Для хранения секретов/ключей
+argon2-cffi==23.1.0
+python-dateutil==2.9.0.post0
+pytz==2024.2
+requests==2.32.3
+pillow==10.4.0

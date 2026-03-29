@@ -1,48 +1,32 @@
-import glob
-import hashlib
-import os
 import json
 import platform
-import shutil
 import subprocess
 import tempfile
-from datetime import datetime, timedelta
-from dateutil import parser
+from datetime import datetime
+from pathlib import Path
 import pytz
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QFont, QDragEnterEvent, QDropEvent
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
-    QPushButton, QHBoxLayout, QFileDialog, QInputDialog,
-    QMessageBox, QComboBox, QLabel, QDialog, QHeaderView, QAbstractItemView, QMenu, QGridLayout
+    QPushButton, QHBoxLayout, QHeaderView, QAbstractItemView, QMenu, QLineEdit
 )
-from datetime import timedelta
 from PyQt5.QtWidgets import QMessageBox, QInputDialog, QFileDialog
 import os
-import shutil
-
+from app.models import LogEntry
+from app.services.backup_container import BackupContainer
 from app.models import FileRecord, FileVersion
-from app.services.file_manager import compute_hash
-from app.services.integrity_manager import now_msk
-from app.models import FileRecord, FileVersion
-from app.services.AddFileThread import AddFileThread
-from app.services.FileDropDialog import FileDropDialog
 from app.services.FileEditDialog import FileEditDialog
-#from app.services.crypto import decrypt_file_to_temp_and_open  # можно использовать, но ниже используем decrypt_file
-from app.services.integrity_manager import check_file_integrity
-# импортируем из security новые утилиты:
+from app.services.integrity_manager import now_msk
 from app.services.security import (
-    hash_password_for_db,
     verify_password_for_db,
     encrypt_file,
     decrypt_file
 )
 from app.reports.reporter import Reporter
 from app.db import SessionLocal
-from app.services.FileWatcher import FileWatcher
-from app.services.file_manager import add_file, compute_hash
-#from app.services.backup_manager import get_last_versions
+from app.services.file_manager import compute_hash
+from app.services.file_manager_new import add_file_new
 
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
@@ -73,9 +57,6 @@ class LocalStoragePage(QWidget):
         self.init_ui()
         self.load_files()
 
-        # FileWatcher для локальных файлов
-        self.watcher = FileWatcher(main_window=self, interval=5, max_versions=self.max_versions)
-        self.watcher.start()
 
     def init_ui(self):
         layout = QVBoxLayout()
@@ -103,7 +84,7 @@ class LocalStoragePage(QWidget):
 
         # === Основные кнопки ===
         buttons = [
-            ("Добавить файл", self.add_file_dialog),
+            ("Добавить файл", self.add_file_dialog_new),
             ("Открыть", self.view_encrypted_file),
             ("Редактировать", self.edit_file_dialog),
             ("Восстановить версию", self.restore_file_dialog),
@@ -151,6 +132,9 @@ class LocalStoragePage(QWidget):
         export_action = more_menu.addAction("Экспорт отчёта")
         export_action.triggered.connect(self.export_report)
 
+        auto_lock_action = more_menu.addAction("Автоблокировка...")
+        auto_lock_action.triggered.connect(self.change_auto_lock)
+
         more_menu.addSeparator()
 
         back_action = more_menu.addAction("Назад")
@@ -167,12 +151,6 @@ class LocalStoragePage(QWidget):
 
         layout.addLayout(actions_layout)
 
-        # === Drag & Drop ===
-        self.setAcceptDrops(True)
-        self.table.setAcceptDrops(True)
-        self.table.dragEnterEvent = self.table_drag_enter
-        self.table.dropEvent = self.table_drop
-
         self.setLayout(layout)
 
         # === Открытие зашифрованного бэкапа ===
@@ -186,201 +164,152 @@ class LocalStoragePage(QWidget):
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(backup_path)[1])
             tmp.write(data)
             tmp.close()
+            
             # Открываем системным редактором
             system = platform.system()
             if system == "Darwin":
-                subprocess.run(["open", tmp.name])
+                subprocess.run(["open", tmp.name], check=False)
             elif system == "Windows":
                 os.startfile(tmp.name)
             else:
-                subprocess.run(["xdg-open", tmp.name])
+                subprocess.run(["xdg-open", tmp.name], check=False)
+            
+            QMessageBox.information(self, "Готово", f"Расшифрованный файл открыт: {tmp.name}\n\nВнимание: временный файл будет удалён при закрытии приложения.")
+            
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось открыть бэкап:\n{e}")
 
-    # === Drag & Drop ===
-    def table_drag_enter(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-            self.setStyleSheet("background-color: #2c2c2c; border: 2px dashed #00c853;")
-        else:
-            event.ignore()
+    def change_auto_lock(self):
+        options = ["15 минут", "30 минут", "1 час", "2 часа", "Никогда"]
+        values = [15, 30, 60, 120, 0]
 
-    def table_drop(self, event):
-        self.setStyleSheet("")
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-            for url in event.mimeData().urls():
-                path = url.toLocalFile()
-                if os.path.isfile(path):
-                    self.add_file_from_path(path)
-        else:
-            event.ignore()
+        current = self.main_window.get_auto_lock_minutes()  # метод добавим в MainWindow
 
+        current_idx = values.index(current) if current in values else 1
+
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Автоблокировка",
+            "Выберите время бездействия до блокировки:",
+            options,
+            current_idx,
+            False
+        )
+
+        if ok:
+            minutes = values[options.index(choice)]
+            self.main_window.set_auto_lock_minutes(minutes)
+            self.main_window.start_auto_lock_timer(minutes)
+            self._save_settings(minutes)
+
+    def _save_settings(self, minutes: int):
+        import json
+        settings_path = Path(__file__).parent / "settings.json"
+
+        settings = {}
+        if settings_path.exists():
+            with open(settings_path, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+
+        settings["auto_lock_minutes"] = minutes
+
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=4, ensure_ascii=False)
 
     def change_max_versions(self, value):
         """
-        Обновляет максимальное количество версий, сохраняет в app/ui/settings.json
-        и удаляет лишние старые версии вместе с файлами бэкапов.
+        Обновляет максимальное количество версий, сохраняет в settings.json
+        и удаляет лишние старые версии из контейнера и БД.
         """
         try:
-            self.max_versions = int(value)
+            new_max = int(value)
+            if new_max < 1:
+                raise ValueError
+            self.max_versions = new_max
         except Exception:
-            QMessageBox.critical(self, "Ошибка", "Неверное значение для количества версий.")
+            QMessageBox.critical(self, "Ошибка", "Количество версий должно быть целым числом ≥ 1")
             return
 
-        # === Путь к settings.json (в той же папке, где этот модуль) ===
-        settings_path = os.path.join(os.path.dirname(__file__), "settings.json")
-
-        # === Чтение существующих настроек ===
+        # Сохранение в settings.json
+        settings_path = Path(__file__).parent / "settings.json"
         settings_data = {}
-        try:
-            if os.path.exists(settings_path):
+        if settings_path.exists():
+            try:
                 with open(settings_path, "r", encoding="utf-8") as f:
                     settings_data = json.load(f)
-        except Exception as e:
-            QMessageBox.warning(self, "Внимание", f"Не удалось прочитать настройки: {e}")
+            except Exception as e:
+                QMessageBox.warning(self, "Внимание", f"Не удалось прочитать настройки: {e}")
 
-        # === Обновление значения и сохранение ===
         settings_data["max_versions"] = self.max_versions
         try:
             with open(settings_path, "w", encoding="utf-8") as f:
                 json.dump(settings_data, f, indent=4, ensure_ascii=False)
         except Exception as e:
-            QMessageBox.warning(self, "Внимание", f"Не удалось записать настройки: {e}")
+            QMessageBox.warning(self, "Внимание", f"Не удалось сохранить настройки: {e}")
+            return
 
         QMessageBox.information(self, "Настройка", f"Теперь будет храниться до {self.max_versions} версий файлов.")
 
-        # === Обновляем watcher и backup_manager ===
+        # Обновляем watcher
+        if hasattr(self, 'watcher') and self.watcher:
+            self.watcher.max_versions = self.max_versions
+
+        # Обрезаем версии в контейнере и БД
+        if not hasattr(self.main_window, 'master_key') or not self.main_window.master_key:
+            QMessageBox.warning(self, "Внимание", "Мастер-ключ недоступен — обрезка в контейнере пропущена")
+            self.load_files()
+            return
+
         try:
-            if self.watcher:
-                self.watcher.max_versions = self.max_versions
-                if hasattr(self.watcher, "backup_manager") and self.watcher.backup_manager is not None:
-                    # если backup_manager хранит max_versions — установим
-                    try:
-                        self.watcher.backup_manager.max_versions = self.max_versions
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+            container = BackupContainer(self.main_window.master_key)
+            session = SessionLocal()
 
-        # === Обрезаем лишние версии ===
-        session = SessionLocal()
-        try:
-            files = session.query(FileRecord).all()
+            for file_record in session.query(FileRecord).all():
+                file_id_str = str(file_record.id)
 
-            # Собираем возможные директории с бэкапами (строки)
-            backup_dirs = []
+                # === Обрезка в контейнере ===
+                if file_id_str in container.data["files"]:
+                    versions = container.data["files"][file_id_str]
 
-            # 1) из watcher.backup_manager.local_backup / external_backup если есть
-            try:
-                if self.watcher and hasattr(self.watcher, "backup_manager") and self.watcher.backup_manager is not None:
-                    bm = self.watcher.backup_manager
-                    for attr in ("local_backup", "external_backup"):
-                        try:
-                            p = getattr(bm, attr, None)
-                            if p:
-                                p_s = str(p)
-                                if p_s and p_s not in backup_dirs:
-                                    backup_dirs.append(p_s)
-                        except Exception:
-                            continue
-            except Exception:
-                pass
+                    # Сортируем по created_at (от старых к новым)
+                    versions.sort(key=lambda v: datetime.fromisoformat(v["created_at"]))
 
-            # 2) fallback: несколько обычных мест (включая тот, что ты использовал)
-            cwd_backup = os.path.join(os.path.dirname(__file__), "..", "backups")
-            cwd_backup = os.path.normpath(os.path.abspath(cwd_backup))
-            if cwd_backup not in backup_dirs:
-                backup_dirs.append(cwd_backup)
-            if os.getcwd() not in backup_dirs:
-                # fallback на рабочую директорию + "backups"
-                backup_dirs.append(os.path.join(os.getcwd(), "backups"))
-            # ещё жестко заданный путь, если он у тебя в проекте используется
-            hardcoded = "/Users/macbook/backups"
-            if hardcoded not in backup_dirs:
-                backup_dirs.append(hardcoded)
+                    if len(versions) > self.max_versions:
+                        # Если достигнут лимит, обрезаем старые версии (включая initial)
+                        # Оставляем самые новые (последние N)
+                        container.data["files"][file_id_str] = versions[-self.max_versions:]
+                        if not container.data["files"][file_id_str]:
+                            del container.data["files"][file_id_str]
+                        print(f"[CLEANUP] Достигнут лимит {self.max_versions} - обрезка старых версий в контейнере для {file_record.name}")
 
-            # Нормализуем и оставляем только существующие/валидные папки (но оставим и несуществующие — для попытки удаления)
-            backup_dirs = [os.path.normpath(os.path.abspath(p)) for p in backup_dirs if p]
-
-            for file in files:
-                # получаем версии (новые — первыми)
-                versions = (
+                # === Обрезка в БД ===
+                db_versions = (
                     session.query(FileVersion)
-                    .filter(FileVersion.file_id == file.id)
+                    .filter(FileVersion.file_id == file_record.id)
                     .order_by(FileVersion.created_at.desc())
                     .all()
                 )
 
-                # если версий больше чем max_versions — удаляем самые старые
-                if len(versions) <= self.max_versions:
-                    continue
+                if len(db_versions) > self.max_versions:
+                    to_delete = db_versions[self.max_versions:]  # старые в начале списка
+                    for v in to_delete:
+                        session.delete(v)
+                    print(f"[CLEANUP] Удалено {len(to_delete)} старых версий из БД для {file_record.name}")
 
-                to_delete = versions[self.max_versions:]  # старые версии (тут порядок: older ones)
-                for old_version in to_delete:
-                    # формируем типичное имя backup: "{file_id}_{YYYYMMDDhhmmss}_{basename}"
-                    ts = old_version.created_at.strftime("%Y%m%d%H%M%S")
-                    filename = os.path.basename(file.path)
-                    expected_name = f"{old_version.file_id}_{ts}_{filename}"
-
-                    deleted_any = False
-
-                    # пробуем удалить точные совпадения в известных директориях
-                    for bdir in backup_dirs:
-                        candidate = os.path.join(bdir, expected_name)
-                        if os.path.exists(candidate):
-                            try:
-                                os.remove(candidate)
-                                deleted_any = True
-                            except Exception:
-                                # игнорируем отдельные ошибки удаления
-                                pass
-
-                        # также пробуем вариант, где копии лежат в подпапке с именем файла:
-                        candidate2 = os.path.join(bdir, filename, expected_name)
-                        if os.path.exists(candidate2):
-                            try:
-                                os.remove(candidate2)
-                                deleted_any = True
-                            except Exception:
-                                pass
-
-                    # если не нашли точные совпадения — используем glob по шаблону (на всякий случай)
-                    if not deleted_any:
-                        import glob
-                        pattern = f"*{old_version.file_id}*{ts}*{filename}*"
-                        for bdir in backup_dirs:
-                            try:
-                                for found in glob.glob(os.path.join(bdir, pattern)):
-                                    try:
-                                        os.remove(found)
-                                        deleted_any = True
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                pass
-
-                    # После попытки удалить файл бэкапа — удаляем запись версии из БД
-                    try:
-                        session.delete(old_version)
-                    except Exception:
-                        # если не удалось удалить запись — игнорируем и продолжим
-                        pass
-
-            # один коммит в конце (если что-то пошло не так, откатим)
+            # Сохраняем изменения
+            container._save()
             session.commit()
+            print(f"[CLEANUP] Обрезка завершена. Текущий лимит: {self.max_versions}")
 
         except Exception as e:
-            session.rollback()
-            QMessageBox.critical(self, "Ошибка", f"Не удалось обрезать старые версии: {e}")
+            if 'session' in locals():
+                session.rollback()
+            QMessageBox.critical(self, "Ошибка", f"Не удалось обрезать версии:\n{e}")
         finally:
-            session.close()
+            if 'session' in locals():
+                session.close()
 
-        # === Обновляем таблицу в UI ===
-        try:
-            self.load_files()
-        except Exception:
-            pass
+        self.load_files()
 
     def load_files(self):
         # Настройка поведения выделения (одна строка, выделяются целиком строки)
@@ -438,61 +367,356 @@ class LocalStoragePage(QWidget):
         else:
             self.table.clearSelection()
 
+    def add_file_dialog_new(self):
+        """Новое добавление файла с поддержкой отмены и Drag&Drop"""
+        from PyQt5.QtWidgets import QProgressDialog, QFileDialog, QInputDialog, QDialog, QVBoxLayout, QPushButton, \
+            QLabel, QHBoxLayout
+        from PyQt5.QtCore import QThread, pyqtSignal, pyqtSlot
 
-    def add_file_dialog(self):
-        dialog = FileDropDialog(self)
-        if dialog.exec_() != QDialog.Accepted or not dialog.file_path:
+        # Создаём диалог с возможностью Drag&Drop
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Добавление файла")
+        dialog.setMinimumWidth(400)
+        dialog.setAcceptDrops(True)  # Включаем Drag&Drop для диалога
+
+        layout = QVBoxLayout()
+
+        # Область для Drag&Drop
+        self.drop_area = QLabel("Перетащите файл сюда\n\nили")
+        self.drop_area.setAlignment(Qt.AlignCenter)
+        self.drop_area.setStyleSheet("""
+            background-color: #f8f9fa;
+            border: 2px dashed #6c757d;
+            padding: 40px;
+            font-size: 16px;
+            color: #6c757d;
+        """)
+        layout.addWidget(self.drop_area)
+
+        # Кнопка выбора файла
+        self.select_btn = QPushButton("Выбрать файл")
+        self.select_btn.clicked.connect(lambda: self._handle_file_selection(dialog))
+        layout.addWidget(self.select_btn)
+
+        # Кнопки управления
+        button_layout = QHBoxLayout()
+        self.next_btn = QPushButton("Далее")
+        self.next_btn.setEnabled(False)  # Изначально кнопка неактивна
+        self.next_btn.clicked.connect(lambda: self._show_password_dialog(dialog))
+
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.clicked.connect(dialog.reject)
+
+        button_layout.addStretch()
+        button_layout.addWidget(self.next_btn)
+        button_layout.addWidget(cancel_btn)
+
+        layout.addLayout(button_layout)
+        dialog.setLayout(layout)
+
+        # Обработчики Drag&Drop для диалога
+        dialog.dragEnterEvent = self._dialog_drag_enter
+        dialog.dropEvent = self._dialog_drop
+
+        result = dialog.exec_()
+
+        if hasattr(self, '_selected_file_path'):
+            delattr(self, '_selected_file_path')
+
+    def _dialog_drag_enter(self, event):
+        """ Обработка входа Drag & Drop на диалог """
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            self.drop_area.setStyleSheet("""
+        background - color:  # e9ecef;
+        border: 2
+        px
+        solid  # 00c853;
+        padding: 40
+        px;
+        font - size: 16
+        px;
+        color:  # 00c853;
+        font - weight: bold;
+        """)
+        else:
+            event.ignore()
+
+
+    def _dialog_drop(self, event):
+        """Обработка Drop на диалоге"""
+        self.drop_area.setStyleSheet("""
+            background-color: #f8f9fa;
+            border: 2px dashed #6c757d;
+            padding: 40px;
+            font-size: 16px;
+            color: #6c757d;
+        """)
+
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            for url in event.mimeData().urls():
+                file_path = url.toLocalFile()
+                if os.path.isfile(file_path):
+                    self._selected_file_path = file_path
+                    # Обновляем надпись с названием файла
+                    file_name = os.path.basename(file_path)
+                    self.drop_area.setText(f"Выбран файл:\n\n{file_name}")
+                    self.next_btn.setEnabled(True)  # Активируем кнопку «Далее»
+                    self.select_btn.hide()  # Скрываем кнопку «Выбрать файл»
+                    event.accept()
+                    break  # Обрабатываем только первый файл
+        else:
+            event.ignore()
+
+    def _handle_file_selection(self, dialog):
+        """ Обрабатывает выбор файла через диалог """
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите файл", "", "Все файлы (*)"
+        )
+        if file_path:
+            self._selected_file_path = file_path
+            # Обновляем надпись с названием файла
+            file_name = os.path.basename(file_path)
+            self.drop_area.setText(f"Выбран файл:\n\n{file_name}")
+            self.next_btn.setEnabled(True)  # Активируем кнопку «Далее»
+            self.select_btn.hide()  # Скрываем кнопку «Выбрать файл»
+
+    def _show_password_dialog(self, parent_dialog):
+        """ Показывает диалог ввода пароля после выбора файла """
+        from PyQt5.QtWidgets import QInputDialog
+
+        password, ok = QInputDialog.getText(
+            self, "Пароль", "Введите пароль для защиты (оставьте пустым если не нужен):", QLineEdit.Password
+        )
+        if not ok:
             return
 
-        path = os.path.abspath(dialog.file_path)
-        password_hash = None
+        parent_dialog.accept()  # Закрываем окно выбора файла
 
-        password, ok = QInputDialog.getText(
-            self, "Пароль", "Введите пароль для защиты (оставьте пустым если не нужен):"
-        )
-        if ok and password:
-            password_hash = hash_password_for_db(password)
-            try:
-                encrypt_file(path, password)
-            except Exception as e:
-                QMessageBox.critical(self, "Ошибка", f"Не удалось зашифровать файл: {e}")
-                return
+        # Запускаем процесс добавления файла с прогресс‑диалогом
+        self._start_file_adding_process(self._selected_file_path, password)
 
-        # Сохраняем поток как атрибут, чтобы GC не уничтожил его
-        self.current_add_thread = AddFileThread(path, password_hash)
-        self.current_add_thread.finished.connect(
-            lambda success, msg: (
-                QMessageBox.information(self, "Результат", msg) if success else QMessageBox.critical(self, "Ошибка",
-                                                                                                     msg),
-                self.load_files()
-            )
-        )
-        self.current_add_thread.start()
+    def _start_file_adding_process(self, file_path, password=None):
+        if not hasattr(self.main_window, 'master_key') or not self.main_window.master_key:
+            QMessageBox.critical(self, "Ошибка", "Мастер-ключ недоступен. Невозможно добавить файл.")
+            return
 
-    def add_file_from_path(self, path: str):
-        path = os.path.abspath(path)
-        password_hash = None
+        from PyQt5.QtWidgets import QProgressDialog
+        from PyQt5.QtCore import QThread, pyqtSignal, pyqtSlot
 
-        password, ok = QInputDialog.getText(
-            self, "Пароль", "Введите пароль для защиты (оставьте пустым если не нужен):"
-        )
-        if ok and password:
-            password_hash = hash_password_for_db(password)
-            try:
-                encrypt_file(path, password)
-            except Exception as e:
-                QMessageBox.critical(self, "Ошибка", f"Не удалось зашифровать файл: {e}")
-                return
+        progress = QProgressDialog("Добавление файла...", "Отмена", 0, 100, self)
+        progress.setWindowTitle("Добавление файла")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
 
-        self.current_add_thread = AddFileThread(path, password_hash)
-        self.current_add_thread.finished.connect(
-            lambda success, msg: (
-                QMessageBox.information(self, "Результат", msg) if success else QMessageBox.critical(self, "Ошибка",
-                                                                                                     msg),
-                self.load_files()
-            )
-        )
-        self.current_add_thread.start()
+        class FileAddWorker(QThread):
+            progress_updated = pyqtSignal(int, str)
+            finished = pyqtSignal(bool, str, object)
+
+            def __init__(self, file_path, password, master_key):
+                super().__init__()
+                self.file_path = file_path
+                self.password = password
+                self.master_key = master_key
+                self._is_cancelled = False
+
+            def cancel(self):
+                self._is_cancelled = True
+
+            def run(self):
+                try:
+                    if self._is_cancelled:
+                        self.finished.emit(False, "Операция отменена пользователем", None)
+                        return self.progress_updated.emit(10, "Чтение файла...")
+                    file_record = add_file_new(
+                        self.file_path,
+                        self.password.strip() if self.password else None,
+                        self.master_key
+                    )
+
+                    if self._is_cancelled:
+                        self.finished.emit(False, "Операция отменена пользователем", None)
+                    else:
+                        self.progress_updated.emit(80, "Сохранение в БД...")
+                        self.progress_updated.emit(100, "Готово!")
+                        self.finished.emit(True, f"Файл '{file_record.name}' добавлен", file_record)
+                except Exception as e:
+                    import traceback
+                    print(f"[ERROR] Ошибка в FileAddWorker: {e}")
+                    traceback.print_exc()
+                    self.finished.emit(False, f"Ошибка: {str(e)}", None)
+
+        worker = FileAddWorker(file_path, password, self.main_window.master_key)
+        self._current_worker = worker
+        self._current_progress = progress
+
+        @pyqtSlot(int, str)
+        def update_progress(value, text):
+            if not progress.wasCanceled():
+                progress.setValue(value)
+                progress.setLabelText(text)
+
+        @pyqtSlot(bool, str, object)
+        def on_operation_finished(success, message, file_record):
+            progress.close()
+            self._current_worker = None
+            self._current_progress = None
+            self._on_file_added_new(success, message, file_record)
+
+        worker.progress_updated.connect(update_progress)
+        worker.finished.connect(on_operation_finished)
+        progress.canceled.connect(worker.cancel)
+        progress.destroyed.connect(self._cleanup_worker)
+        worker.start()
+
+    def _start_file_deleting_process(self, file_id, delete_original=False):
+        """Запускает процесс удаления файла с прогресс-баром и поддержкой отмены"""
+        if not hasattr(self.main_window, 'master_key') or not self.main_window.master_key:
+            QMessageBox.critical(self, "Ошибка", "Мастер-ключ недоступен. Невозможно удалить файл.")
+            return
+
+        from PyQt5.QtWidgets import QProgressDialog
+        from PyQt5.QtCore import QThread, pyqtSignal, pyqtSlot
+        from app.services.DeleteFileThread import DeleteFileThread
+        from app.services.backup_container import BackupContainer
+
+        progress = QProgressDialog("Удаление файла...", "Отмена", 0, 100, self)
+        progress.setWindowTitle("Удаление файла")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.show()
+
+        class FileDeleteWorker(QThread):
+            progress_updated = pyqtSignal(int, str)
+            finished = pyqtSignal(bool, str)
+
+            def __init__(self, file_id, delete_original, master_key):
+                super().__init__()
+                self.file_id = file_id
+                self.delete_original = delete_original
+                self.master_key = master_key
+                self._is_cancelled = False
+                self._delete_thread = None
+
+            def cancel(self):
+                self._is_cancelled = True
+                if self._delete_thread and self._delete_thread.isRunning():
+                    self._delete_thread.cancel()
+
+            def run(self):
+                try:
+                    if self._is_cancelled:
+                        self.finished.emit(False, "Операция отменена пользователем")
+                        return
+
+                    self.progress_updated.emit(10, "Подготовка к удалению...")
+                    
+                    # Получаем контейнер
+                    container = BackupContainer(self.master_key)
+                    
+                    if self._is_cancelled:
+                        self.finished.emit(False, "Операция отменена пользователем")
+                        return
+
+                    self.progress_updated.emit(30, "Удаление из контейнера...")
+                    
+                    # Создаем и запускаем DeleteFileThread
+                    self._delete_thread = DeleteFileThread(
+                        self.file_id, 
+                        self.delete_original, 
+                        container
+                    )
+                    
+                    # Подключаем сигналы
+                    self._delete_thread.finished.connect(self._on_delete_thread_finished)
+                    
+                    # Запускаем удаление
+                    self._delete_thread.start()
+                    
+                    # Ожидаем завершения с проверкой отмены
+                    while self._delete_thread.isRunning():
+                        if self._is_cancelled:
+                            self._delete_thread.cancel()
+                            self._delete_thread.wait(2000)
+                            self.finished.emit(False, "Операция отменена пользователем")
+                            return
+                        
+                        self.msleep(100)  # Небольшая задержка
+                    
+                    self.progress_updated.emit(100, "Готово!")
+                    
+                except Exception as e:
+                    import traceback
+                    print(f"[ERROR] Ошибка в FileDeleteWorker: {e}")
+                    traceback.print_exc()
+                    self.finished.emit(False, f"Ошибка: {str(e)}")
+
+            def _on_delete_thread_finished(self, success, message):
+                """Обработка завершения DeleteFileThread"""
+                if self._is_cancelled:
+                    self.finished.emit(False, "Операция отменена пользователем")
+                else:
+                    self.finished.emit(success, message)
+
+        worker = FileDeleteWorker(file_id, delete_original, self.main_window.master_key)
+        self._current_worker = worker
+        self._current_progress = progress
+
+        @pyqtSlot(int, str)
+        def update_progress(value, text):
+            if not progress.wasCanceled():
+                progress.setValue(value)
+                progress.setLabelText(text)
+
+        @pyqtSlot(bool, str)
+        def on_operation_finished(success, message):
+            progress.close()
+            self._current_worker = None
+            self._current_progress = None
+            self._on_file_deleted(success, message)
+
+        worker.progress_updated.connect(update_progress)
+        worker.finished.connect(on_operation_finished)
+        progress.canceled.connect(worker.cancel)
+        progress.destroyed.connect(self._cleanup_worker)
+        worker.start()
+
+
+    def _cleanup_worker(self):
+            """Очистка ресурсов при уничтожении диалога"""
+            if hasattr(self, '_current_worker') and self._current_worker:
+                # Если поток ещё выполняется, отменяем и ждём завершения
+                if self._current_worker.isRunning():
+                    self._current_worker.cancel()
+                    self._current_worker.wait(2000)  # Ждём до 2 секунд
+                # Освобождаем ресурсы
+                self._current_worker = None
+            if hasattr(self, '_current_progress'):
+                self._current_progress = None
+
+    def _on_file_added_new(self, success, message, file_record):
+            """Обработка результата добавления файла"""
+            if success:
+                QMessageBox.information(self, "Успех", message)
+                if file_record:
+                    print(f"[ADD_FILE_NEW] Файл добавлен: {file_record.name} (ID: {file_record.id})")
+            else:
+                QMessageBox.critical(self, "Ошибка", message)
+
+            self.load_files()
+
+    def _on_file_deleted(self, success, message):
+        """Обработка результата удаления файла"""
+        if success:
+            QMessageBox.information(self, "Успех", message)
+            print(f"[DELETE_FILE] Операция удаления завершена: {message}")
+        else:
+            QMessageBox.critical(self, "Ошибка", message)
+            print(f"[DELETE_FILE] Ошибка удаления: {message}")
+
+        self.load_files()
+
+
 
     def view_encrypted_file(self):
         row = self.table.currentRow()
@@ -547,6 +771,7 @@ class LocalStoragePage(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось открыть файл:\n{e}")
 
+
     def edit_file_dialog(self):
         row = self.table.currentRow()
         if row == -1:
@@ -557,11 +782,15 @@ class LocalStoragePage(QWidget):
         if not file_record:
             QMessageBox.warning(self, "Ошибка", "Файл не найден в базе")
             return
-        dialog = FileEditDialog(self.db, file_record, self)
+
+        master_key = self.main_window.master_key if hasattr(self.main_window, 'master_key') else None
+        if not master_key:
+            QMessageBox.critical(self, "Ошибка", "Мастер-ключ недоступен")
+            return
+
+        dialog = FileEditDialog(self.db, file_record, self, master_key=master_key)
         dialog.exec_()
         self.load_files()
-
-
 
     def restore_file_dialog(self):
         row = self.table.currentRow()
@@ -575,81 +804,108 @@ class LocalStoragePage(QWidget):
             QMessageBox.warning(self, "Ошибка", "Файл не найден")
             return
 
-        # === Загружаем версии файла ===
-        versions = (
-            self.db.query(FileVersion)
-            .filter(FileVersion.file_id == file_id)
-            .order_by(FileVersion.created_at.desc())
-            .limit(self.max_versions)
-            .all()
-        )
+        # Перезагружаем объект из БД, чтобы password_hash был актуальным
+        self.db.refresh(file_record)
+        print(
+            f"[DEBUG RESTORE] password_hash после refresh: {file_record.password_hash} (type: {type(file_record.password_hash)})")
 
-        if not versions:
-            QMessageBox.information(self, "Информация", "Нет доступных резервных версий")
+        # Получаем контейнер
+        if not hasattr(self.main_window, 'master_key') or not self.main_window.master_key:
+            QMessageBox.critical(self, "Ошибка", "Мастер-ключ недоступен")
             return
 
-        # Показываем список версий
-        items = [
-            f"{v.created_at.astimezone(MOSCOW_TZ).strftime('%Y-%m-%d %H:%M:%S')} | {v.comment or ''}"
-            for v in versions
-        ]
+        container = BackupContainer(self.main_window.master_key)
+
+        # Версии из контейнера
+        versions_data = container.get_all_versions(str(file_id))
+        if not versions_data:
+            QMessageBox.information(self, "Информация", "Нет доступных версий в контейнере")
+            return
+
+        items = []
+        for idx, v in enumerate(versions_data):
+            dt = datetime.fromisoformat(v["created_at"])
+            items.append(f"{dt.strftime('%Y-%m-%d %H:%M:%S')} | {v.get('comment', '')}")
 
         item, ok = QInputDialog.getItem(self, "Выберите версию", "Версия:", items, editable=False)
         if not (ok and item):
             return
 
         version_index = items.index(item)
-        version = versions[version_index]
+        selected_version = versions_data[version_index]
 
-        # === Получаем МСК-время версии ===
-        version_msk = version.created_at.astimezone(MOSCOW_TZ)
-        timestamp_str = version_msk.strftime("%Y%m%d%H%M%S")
-
-        # === Формируем путь к бэкапу ===
-        backup_root = "/Users/macbook/backups"
-        filename = os.path.basename(file_record.path)
-
-        backup_path = os.path.join(
-            backup_root,
-            f"{file_id}_{timestamp_str}_{filename}"
-        )
-
-        if not os.path.exists(backup_path):
-            QMessageBox.critical(
-                self,
-                "Ошибка",
-                f"Резервная копия не найдена:\n{backup_path}"
-            )
-            return
-
-        # === Куда сохранять восстановленный файл ===
+        # Куда восстановить
         restore_path, _ = QFileDialog.getSaveFileName(
             self,
             "Куда восстановить файл",
-            os.path.basename(file_record.path)
+            file_record.name
         )
         if not restore_path:
             return
 
         try:
-            shutil.copy2(backup_path, restore_path)
+            # Получаем plaintext контент из контейнера
+            content_bytes = bytes.fromhex(selected_version["content"])
+            
+            # Определяем формат восстановления
+            if file_record.password_hash is not None and file_record.password_hash.strip():
+                # Файл зашифрован в БД → восстанавливаем зашифрованным
+                print("[DEBUG RESTORE] Файл зашифрован → восстанавливаем в зашифрованном виде")
+                
+                # Запрашиваем пароль ОДИН РАЗ
+                password, ok = QInputDialog.getText(
+                    self, "Пароль", "Введите пароль для шифрования восстановленного файла:", QLineEdit.Password
+                )
+                if not (ok and password):
+                    return
+                
+                # Проверяем пароль
+                if not verify_password_for_db(password, file_record.password_hash):
+                    QMessageBox.critical(self, "Ошибка", "Неверный пароль")
+                    return
+                
+                # Сначала пишем plaintext
+                with open(restore_path, "wb") as f:
+                    f.write(content_bytes)
+                
+                # Затем шифруем файл
+                encrypt_file(restore_path, password)
+                print("[DEBUG RESTORE] Файл успешно зашифрован")
+                
+            else:
+                # Файл plaintext в БД → восстанавливаем как plaintext
+                print("[DEBUG RESTORE] Файл plaintext → восстанавливаем без шифрования")
+                
+                # Просто пишем plaintext контент
+                with open(restore_path, "wb") as f:
+                    f.write(content_bytes)
+                
+                print("[DEBUG RESTORE] Файл успешно восстановлен как plaintext")
 
-            # обновляем хэш
-            file_record.current_hash = compute_hash(restore_path)
+            # Обновляем хэш в БД (оригинального файла, а не копии)
+            file_record.current_hash = compute_hash(file_record.path)
             file_record.updated_at = now_msk()
             self.db.commit()
 
-            QMessageBox.information(
-                self,
-                "Готово",
-                f"Файл восстановлен:\n{restore_path}\n"
-                f"Из резервной копии:\n{os.path.basename(backup_path)}"
-            )
+            # Показываем сообщение об успехе
+            QMessageBox.information(self, "Успех", f"Файл успешно восстановлен в:\n{restore_path}")
+
+            # Лог восстановления
+            session = SessionLocal()
+            session.add(LogEntry(
+                action="restore_version",
+                file_name=file_record.name,
+                result=f"Восстановлена версия от {selected_version['created_at']} в {restore_path}",
+                user_name=os.getlogin(),
+                timestamp=now_msk()
+            ))
+            session.commit()
+            session.close()
+
             self.load_files()
 
         except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось восстановить файл:\n{e}")
-
+            QMessageBox.critical(self, "Ошибка", f"Не удалось восстановить:\n{e}")
 
 
     def export_report(self):

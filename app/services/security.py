@@ -28,6 +28,20 @@ def derive_key(password: str, salt: bytes) -> bytes:
     )
     return base64.urlsafe_b64encode(kdf.derive(password.encode()))
 
+def decrypt_file_from_bytes(encrypted_data: bytes, password: str) -> bytes:
+    """
+    Расшифровывает байты файла, используя соль из первых 16 байт.
+    """
+    if len(encrypted_data) < 16:
+        raise ValueError("Повреждённые зашифрованные данные")
+
+    salt = encrypted_data[:16]
+    ciphertext = encrypted_data[16:]
+
+    key = derive_key(password, salt)  # твоя функция derive_key (PBKDF2 или что у тебя)
+    fernet = Fernet(key)
+    return fernet.decrypt(ciphertext)
+
 def encrypt_file(file_path: str, password: str):
     """Шифрует файл, сохраняет соль + зашифрованные данные"""
     if not os.path.exists(file_path):
