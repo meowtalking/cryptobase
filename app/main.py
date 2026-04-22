@@ -1,5 +1,7 @@
 import sys
 from PyQt5.QtWidgets import QApplication
+
+from app.db import BACKUPS_PATH
 from app.ui.main_window import MainWindow
 
 import os
@@ -7,7 +9,7 @@ import subprocess
 from pathlib import Path
 
 def setup_secure_folder():
-    folder = Path.home() / ".cryptobase"
+    folder = BACKUPS_PATH / ".cryptobase"
     try:
         # Создаём папку, если её нет
         folder.mkdir(parents=True, exist_ok=True)

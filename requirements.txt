@@ -30,3 +30,4 @@ python-dateutil==2.9.0.post0
 pytz==2024.2
 requests==2.32.3
 pillow==10.4.0
+platformdirs

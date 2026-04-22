@@ -11,7 +11,9 @@ import json
 import secrets
 from typing import Dict, Any, Optional
 
-CONFIG_DIR = Path.home() / ".cryptobase"
+from app.db import BACKUPS_PATH
+
+CONFIG_DIR = BACKUPS_PATH / ".cryptobase"
 CONTAINER_PATH = CONFIG_DIR / "backups.enc"
 
 

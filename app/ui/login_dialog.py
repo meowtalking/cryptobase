@@ -8,8 +8,10 @@ from argon2 import PasswordHasher, low_level
 from argon2.exceptions import VerifyMismatchError
 import secrets
 
+from app.db import BACKUPS_PATH
+
 # Константы
-CONFIG_DIR = Path.home() / ".cryptobase"
+CONFIG_DIR = BACKUPS_PATH / ".cryptobase"
 SALT_FILE = CONFIG_DIR / "master_salt.bin"
 HASH_FILE = CONFIG_DIR / "master_hash.bin"
 

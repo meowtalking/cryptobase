@@ -8,6 +8,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from app.db import BACKUPS_PATH
+
 # Add project to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -56,7 +58,7 @@ def test_backup_formats():
         }
         container.add_version(file_id, version_data)
         
-        container_path = Path.home() / ".cryptobase" / "backups.enc"
+        container_path = BACKUPS_PATH / ".cryptobase" / "backups.enc"
         if container_path.exists():
             print(f"   Container size: {container_path.stat().st_size}")
             
